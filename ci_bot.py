@@ -75,6 +75,7 @@ build_message_id = None
 use_banner = False
 build_process = None
 previous_progress = ""
+build_start_time = 0
 
 TELEGRAM_BASE_URL = f"https://api.telegram.org/bot{CONFIG_BOT_TOKEN}"
 
@@ -111,7 +112,8 @@ class BannerGenerator:
             
             cluster_sizes = [len(c) for c in clusters]
             return [c for _, c in sorted(zip(cluster_sizes, centroids), reverse=True)][:num_colors]
-        except:
+        except Exception as e:
+            print(f"Error in get_dominant_colors: {e}")
             return [(201, 253, 211), (100, 180, 255), (180, 100, 255)]
     
     def fetch_avatar(self, avatar_url):
@@ -195,7 +197,7 @@ class BannerGenerator:
             if os.path.exists(font_path):
                 try:
                     return ImageFont.truetype(font_path, size)
-                except:
+                except Exception:
                     pass
         return ImageFont.load_default()
     
@@ -349,7 +351,7 @@ def edit_message(message_id, text, chat_id=None, reply_markup=None):
         'disable_web_page_preview': True
     }
     if reply_markup:
-        data['reply_markup'] = reply_markup
+        data['reply_markup'] = json.dumps(reply_markup)
     result = telegram_request('editMessageText', data=data)
     if not result:
         print(f"⚠️  Failed to edit message {message_id}", file=sys.stderr)
@@ -364,7 +366,7 @@ def edit_photo_caption(message_id, caption, chat_id=None, reply_markup=None):
         'parse_mode': 'HTML'
     }
     if reply_markup:
-        data['reply_markup'] = reply_markup
+        data['reply_markup'] = json.dumps(reply_markup)
     result = telegram_request('editMessageCaption', data=data)
     if not result:
         print(f"⚠️  Failed to edit photo caption {message_id}", file=sys.stderr)
@@ -437,8 +439,24 @@ def generate_build_banner():
 # BUILD FUNCTIONS
 # ============================================================================
 
+def render_bar(p):
+    """Render progress bar"""
+    p = max(0, min(100, p))
+    return "█" * (p // 10) + "░" * (10 - p // 10)
+
+def parse_progress():
+    """Parse progress from build log"""
+    if not os.path.exists(BUILD_LOG):
+        return 0, 0, 0
+    with open(BUILD_LOG) as f:
+        for line in reversed(f.readlines()[-300:]):
+            m = re.search(r'(\d+)%\s+(\d+)/(\d+)', line)
+            if m:
+                return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return 0, 0, 0
+
 def fetch_progress():
-    """Fetch build progress from build.log"""
+    """Fetch build progress from build.log with enhanced display"""
     if not os.path.exists(BUILD_LOG):
         return "Initializing..."
     
@@ -470,7 +488,24 @@ def fetch_progress():
             if 'Running:' in line and 'ota_from_target_files' in line:
                 return "📦 Packing final ROM..."
         
-        # Try multiple patterns to match different build log formats
+        # Get enhanced progress with bar and ETA
+        percent, done, total = parse_progress()
+        if percent > 0:
+            elapsed = int(time.time() - build_start_time) if build_start_time > 0 else 0
+            
+            # Calculate ETA
+            eta = "Calculating…"
+            if percent > 5:
+                total_time = elapsed * 100 / percent
+                remain = max(0, int(total_time - elapsed))
+                eta = f"{remain//60}m {remain%60}s"
+            
+            # Calculate speed
+            speed = f"{done/elapsed:.1f}" if elapsed > 0 else "0"
+            
+            return f"{render_bar(percent)} {percent}% ({done}/{total})\n⚡ {speed} t/s | ETA: {eta}"
+        
+        # Fallback to original patterns
         for line in reversed(lines):
             # Pattern 1: [ 45% 1300/20000] or [45% 1300/20000]
             match = re.search(r'\[\s*(\d+)%\s+(\d+)/(\d+)\]', line)
@@ -495,7 +530,7 @@ def fetch_progress():
             return "Building..."
         
         return "Initializing the build system..."
-    except:
+    except Exception:
         return "Initializing..."
 
 def tail_build_log():
@@ -510,7 +545,7 @@ def tail_build_log():
                     last_position = f.tell()
                     for line in new_lines:
                         print(line.rstrip())
-            except:
+            except Exception:
                 pass
         time.sleep(0.5)
 
@@ -798,7 +833,7 @@ def detect_android_version():
                 match = re.search(r'android-(\d+)\.\d+\.\d+', content)
                 if match:
                     return match.group(1)
-        except:
+        except Exception:
             pass
     return "Unknown"
 
@@ -807,13 +842,12 @@ def update_telegram_status(status_msg):
     (edit_photo_caption if use_banner else edit_message)(build_message_id, status_msg)
 
 def main():
-    global OUT_DIR, ANDROID_VERSION, build_message_id, use_banner, build_process
+    global OUT_DIR, ANDROID_VERSION, build_message_id, use_banner, build_process, build_start_time
     
     # Parse arguments
     parser = argparse.ArgumentParser(description='CI Bot - Automated ROM Build Script')
     parser.add_argument('-s', '--sync', action='store_true', help='Sync sources before building')
     parser.add_argument('-c', '--clean', action='store_true', help='Clean build directory')
-    parser.add_argument('--c-d', '--clean-device', action='store_true', help='Clean device directory')
     args = parser.parse_args()
     
     signal.signal(signal.SIGINT, handle_interrupt)
@@ -848,7 +882,7 @@ def main():
 
 <b>• ROM:</b> <code>{ROM_NAME}</code>
 <b>• DEVICE:</b> <code>{DEVICE}</code>""")
-        except:
+        except Exception:
             edit_message(sync_msg_id, "🔴 | <i>Sync failed, continuing with build...</i>")
     
     # Clean if requested
@@ -949,7 +983,7 @@ def main():
                 if any(pattern in log_content for pattern in error_patterns):
                     build_failed = True
                     print("❌ Build failed! (errors detected in log)")
-        except:
+        except Exception:
             pass
     
     if build_failed:
@@ -993,7 +1027,7 @@ def main():
                         max_total = total
                     if current > last_current:
                         last_current = current
-        except:
+        except Exception:
             pass
         
         # Use the last current action count and max total
@@ -1036,7 +1070,13 @@ def main():
         
         # Upload boot images if vendor_boot.img exists
         boot_images = {}
-        if os.path.exists(os.path.join(OUT_DIR, 'vendor_boot.img')):
+        boot_files_to_upload = []
+        for img_name in ['vendor_boot.img', 'boot.img', 'init_boot.img']:
+            img_path = os.path.join(OUT_DIR, img_name)
+            if os.path.exists(img_path):
+                boot_files_to_upload.append((img_name, img_path))
+        
+        if boot_files_to_upload:
             update_telegram_status(f"""<b>📤 Uploading Files...</b>
 
 <b>Device:</b> {DEVICE} | <b>Android:</b> {ANDROID_VERSION}
@@ -1044,11 +1084,9 @@ def main():
 
 <b>⏳ Status:</b> Uploading boot images...""")
             
-            for img_name in ['vendor_boot.img', 'boot.img', 'init_boot.img']:
-                img_path = os.path.join(OUT_DIR, img_name)
-                if os.path.exists(img_path):
-                    print(f"📤 Uploading {img_name}...")
-                    boot_images[img_name] = upload_file(img_path)
+            for img_name, img_path in boot_files_to_upload:
+                print(f"📤 Uploading {img_name}...")
+                boot_images[img_name] = upload_file(img_path)
         
         # Upload OTA JSON for AxionAOSP builds
         ota_json_url = None
